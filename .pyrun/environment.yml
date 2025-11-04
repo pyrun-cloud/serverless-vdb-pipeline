@@ -17,6 +17,11 @@ dependencies:
   - ipykernel
   - ipywidgets
   - git
+  - faiss-cpu
+  - numpy
+  - pandas
+  - boto3
+  - orjson
 
   - pip:
     - $LITHOPS

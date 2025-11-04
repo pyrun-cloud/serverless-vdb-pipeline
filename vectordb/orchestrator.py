@@ -1,0 +1,213 @@
+from lithops import FunctionExecutor, Storage
+
+from vectordb.config import SvlessVectorDBParams
+from .centroids import CentroidMaster
+import numpy as np
+import time
+from .querying import get_mult_neighours, reduce_mult_neighbours
+
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import orjson
+
+class Orchestrator():
+    
+    def __init__(self, config: SvlessVectorDBParams, window_time=60):
+        self.window_time = window_time
+        self.function_executor = FunctionExecutor()
+        self.config = config
+        self.pool = ThreadPoolExecutor(max_workers=20)  
+        
+    def shuffle_queries(self, keys, n):
+        
+        start = time.time()
+        res = self.function_executor.storage.get_object(bucket=self.config.storage_bucket, key=f'indexes/{self.config.dataset}/{self.config.implementation}/{self.config.num_index}/{self.config.centroids_key}')
+        centroids = np.array(orjson.loads(res))
+        master = CentroidMaster(centroids, len(centroids[0]))
+        
+        dict = defaultdict(list)
+        
+        # Modify
+        query_id = 0
+        
+        # ObjStorage -> Pravega or Kinesis
+        for key in keys:
+            distances, index_ids = master.get_centroid_ids(key, n)
+            key_list = key.tolist()
+            for id, distance in zip(index_ids[0], distances[0]):
+                dict[id].append ([query_id, key_list])                                 
+            query_id += 1
+                
+        end = time.time()                
+        return dict, end - start
+        
+        
+    def create_map_iterdata(self, payload, batch_size):
+        
+        map_keys = []
+        storage = Storage()
+        start = time.time()
+        query_info = {}
+        local_counter = 0
+        filename_counter = 0
+
+        for key, items in payload.items():
+            query_info[f'indexes/{self.config.dataset}/{self.config.implementation}/{self.config.num_index}/centroid_{key}.ann'] = items
+            local_counter += 1
+            if local_counter == batch_size:
+                filename = f'queries/batch_{filename_counter}.json'
+                self.pool.submit(storage.put_object, self.config.storage_bucket, filename, orjson.dumps(query_info))
+                map_keys.append(filename)
+
+                filename_counter += 1
+                local_counter = 0
+                query_info = {}
+
+        if query_info:
+            filename = f'queries/batch_{filename_counter}.json'
+            self.pool.submit(storage.put_object, self.config.storage_bucket, filename, orjson.dumps(query_info))
+            map_keys.append(filename)
+        
+        self.pool.shutdown(wait=True)
+        end = time.time()
+        return map_keys, end - start
+    
+    
+    def create_reduce_iterdata(self, payload, k, num_queries):
+
+        start = time.time()
+        storage = Storage()
+        reduce_keys = []
+
+        reduce_iterdata = defaultdict(list)
+        for query_dict in payload:
+            for key, value in query_dict.items():
+                reduce_iterdata[key] = reduce_iterdata[key] + value
+        sorted_reduce_iterdata = dict(sorted(reduce_iterdata.items()))       
+        
+        queries = []
+        i = 0
+        j = 0
+        for key, value in sorted_reduce_iterdata.items():
+            queries.append([key, value])
+            
+            i += 1
+            
+            if i == num_queries:
+                key = f'reduce/res_{j}.json'
+                storage.put_object(bucket=self.config.storage_bucket, key=key, body=orjson.dumps({"queries": queries, "k": k}))
+                reduce_keys.append(key)
+                j += 1
+                queries = []
+                i = 0
+                
+        if len(queries) > 0:     
+            key = f'reduce/res_{j}.json'
+            storage.put_object(bucket=self.config.storage_bucket, key=key, body=orjson.dumps({"queries": queries, "k": k}))
+            reduce_keys.append(key)
+        
+        end = time.time()
+        return reduce_keys, end - start
+    
+    
+    def divide_map_results(self, futures_res):
+        
+        results = []
+        times = []
+        
+        for res in futures_res:
+            results.append(res[0])
+            times.append(res[1])
+            
+        return results, times
+    
+    def divide_reduce_results(self, futures_res):
+        
+        results = []
+        times = []
+        
+        for res in futures_res:
+            for q_res in res[0]:
+                results.append(q_res)
+                
+            times.append(res[1])
+            
+        return results, times
+        
+    
+    def search(self, id_query, queries, n, k_search, k_result):
+                
+        start = time.time()
+
+        init = time.time()
+        if self.config.implementation == "blocks":
+            queries_key = f"queries_{self.config.dataset}_{self.config.num_index}.csv"
+            self.function_executor.storage.put_object(bucket=self.config.storage_bucket, key=queries_key, body=orjson.dumps(queries.tolist()))
+            index_to_compute = [ ((queries_key, list(range(i, min(i + self.config.query_batch_size, self.config.num_index)))), k_search, self.config) for i in range(0, self.config.num_index, self.config.query_batch_size) ]
+        
+        if self.config.implementation == "centroids":
+            # Get centroids
+            centroids, shuffle_times = self.shuffle_queries(queries, n)
+            # Map
+            map_keys, map_iterdata_times = self.create_map_iterdata(centroids, self.config.query_batch_size)
+            index_to_compute = [(x, k_search, self.config) for x in map_keys]
+        
+        create_map_data = time.time()
+
+        if self.function_executor.config["lithops"]["backend"] == "k8s":
+            self.function_executor.config["k8s"]["runtime_cpu"] = self.config.search_map_cpus
+            self.function_executor.config["k8s"]["runtime_memory"] = self.config.search_map_mem        
+        
+        futures = self.function_executor.map(get_mult_neighours, index_to_compute, runtime_memory=self.config.search_map_mem)
+        map_futures_res = self.function_executor.get_result(wait_dur_sec=0)
+
+        lambda_invocation_map = [f.stats["worker_func_start_tstamp"] - f.stats["host_job_create_tstamp"] for f in futures]
+        
+        map_execution = time.time()
+
+        map_res, map_times = self.divide_map_results(map_futures_res)
+         
+        # Reduce
+        reduce_iterdata, reduce_iterdata_times = self.create_reduce_iterdata(map_res, k_result, 1000)
+
+        if self.function_executor.config["lithops"]["backend"] == "k8s":
+            self.function_executor.config["k8s"]["runtime_cpu"] = self.config.search_reduce_cpus
+            self.function_executor.config["k8s"]["runtime_memory"] = self.config.search_reduce_mem
+        
+        reduce_iterdata = [(x, self.config) for x in reduce_iterdata]
+
+        create_reduce_data = time.time()
+
+        futures = self.function_executor.map(reduce_mult_neighbours, reduce_iterdata, runtime_memory=self.config.search_reduce_mem)
+        reduce_futures_res = self.function_executor.get_result(wait_dur_sec=0)
+
+        lambda_invocation_reduce = [f.stats["worker_func_start_tstamp"] - f.stats["host_job_create_tstamp"] for f in futures]
+
+        reduce_execution = time.time()
+        
+        reduce_res, reduce_times = self.divide_reduce_results(reduce_futures_res)
+        
+        end = time.time()
+        
+        timers = {}
+
+        timers[f'{id_query}_shuffle_{self.config.implementation}'] = []
+        timers[f'{id_query}_map_iterdata_{self.config.implementation}'] = []
+
+        if self.config.implementation == "centroids":
+            timers[f'{id_query}_shuffle_{self.config.implementation}'] = shuffle_times
+        
+            timers[f'{id_query}_map_iterdata_{self.config.implementation}'] = map_iterdata_times
+        timers[f'{id_query}_create_map_data{self.config.implementation}'] = create_map_data - init
+        timers[f'{id_query}_map_{self.config.implementation}'] = map_times
+        timers[f'{id_query}_map_invocation_{self.config.implementation}'] = lambda_invocation_map
+        timers[f'{id_query}_map_execution_{self.config.implementation}'] = map_execution - create_map_data
+        timers[f'{id_query}_create_reduce_data_{self.config.implementation}'] = create_reduce_data - map_execution
+        timers[f'{id_query}_reduce_iterdata_{self.config.implementation}'] = reduce_iterdata_times
+        timers[f'{id_query}_reduce_{self.config.implementation}'] = reduce_times
+        timers[f'{id_query}_reduce_invocation_{self.config.implementation}'] = lambda_invocation_reduce
+        timers[f'{id_query}_reduce_execution_{self.config.implementation}'] = reduce_execution - create_reduce_data
+        timers[f'{id_query}_divide_reduce_{self.config.implementation}'] = end - reduce_execution
+        timers[f'{id_query}_total_querying_{self.config.implementation}'] = end - start
+    
+        return reduce_res, timers
